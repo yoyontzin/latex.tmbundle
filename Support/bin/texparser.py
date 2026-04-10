@@ -1,341 +1,199 @@
-import sys
-import re
-import os.path
-import os
-import tmprefs
-from struct import *
+#!/usr/bin/env -S "${TM_BUNDLE_SUPPORT}/bin/python"
+# encoding: utf-8
 
-import urllib
+# -- Imports ------------------------------------------------------------------
 
-def percent_escape(str):
-	return re.sub('[\x80-\xff /&]', lambda x: '%%%02X' % unpack('B', x.group(0))[0], str)
+from __future__ import print_function
+from __future__ import unicode_literals
 
-# Swapped call to percent_escape with urllib.quote.  Was causing links to fail in TM2
-def make_link(file, line):
-	return 'txmt://open/?url=file://' + urllib.quote(file) + '&amp;line=' + line
+from os import sys, path
 
-def shell_quote(string):
-	return '"' + re.sub(r'([`$\\"])', r'\\\1', string) + '"'
+sys.path.insert(
+    1,
+    path.dirname(path.dirname(path.abspath(__file__))) + "/lib/Python")
+
+from argparse import ArgumentParser
+from io import open
+from os import getenv
+from os.path import basename, dirname, join
+from pickle import load, dump
+from pipes import quote as shellquote
+from subprocess import check_output, STDOUT
+from sys import version_info
+
+from parsing import LaTexMkParser
+from tex import encodings
+from gutter import update_marks
+
+# -- Module Import ------------------------------------------------------------
+
+PYTHON2 = version_info <= (3, 0)
+
+if PYTHON2:
+    import sys
+    reload(sys)  # noqa
+    sys.setdefaultencoding("utf-8")
+
+# -- Functions ----------------------------------------------------------------
 
 
-class TexParser(object):
-    """Master Class for Parsing Tex Typsetting Streams"""
-    def __init__(self, input_stream, verbose):
-        super(TexParser, self).__init__()
-        self.input_stream = input_stream
-        self.patterns = []
-        self.done = False
-        self.verbose = verbose
-        self.numErrs = 0
-        self.numWarns = 0
-        self.isFatal = False
-        self.fileStack = []  #TODO: long term - can improve currentFile handling by keeping track of (xxx and )
+def notify(title='LaTeX Watch', summary='', messages=[], token=None):
+    """Display a list of messages via a notification window.
 
-    def getRewrappedLine(self):
-        """Sometimes TeX breaks up lines with hard linebreaks.  This is annoying.
-           Even more annoying is that it sometime does not break line, for two distinct 
-           warnings. This function attempts to return a single statement."""
-        statement = ""
-        while True:
-            line = self.input_stream.readline()
-            if not line:
-                if statement: 
-                    return statement
-                else:
-                    return ""
-            statement += line.rstrip("\n")
-            if len(line) != 80: # including line break
-                break
-        return statement+"\n"
-    
-    def parseStream(self):
-        """Process the input_stream one line at a time, matching against
-           each pattern in the patterns dictionary.  If a pattern matches
-           call the corresponding method in the dictionary.  The dictionary
-           is organized with patterns as the keys and methods as the values."""
-        line = self.getRewrappedLine()
-        while line and not self.done:
-            line = line.rstrip("\n")
-            foundMatch = False
+    This function returns a notification token that can be used to reuse the
+    opened notification window.
 
-            # process matching patterns until we find one
-            for pat,fun in self.patterns:
-                myMatch = pat.match(line)
-                if myMatch:
-                    fun(myMatch,line)
-                    sys.stdout.flush()
-                    foundMatch = True
-                    break
-            if self.verbose and not foundMatch:
-                print line
-            
-            line = self.getRewrappedLine()
-        if self.done == False:
-            self.badRun()
-        return self.isFatal, self.numErrs, self.numWarns
+    Arguments:
 
-    def info(self,m,line):
-        print '<p class="info">'
-        print line
-        print '</p>'
+        title
 
-    def error(self,m,line):
-        print '<p class="error">'
-        print line
-        print '</p>'
-        self.numErrs += 1
-        
-    def warning(self,m,line):
-        print '<p class="warning">'
-        print line
-        print '</p>'
-        self.numWarns += 1
+            The (window) title for the notification window.
 
-    def warn2(self,m,line):
-        print '<p class="fmtWarning">'
-        print line
-        print '</p>'
-        
-    def fatal(self,m,line):
-        print '<p class="error">'
-        print line
-        print '</p>'
-        self.isFatal = True
+        summary
 
-    def badRun(self):
-        """docstring for finishRun"""
-        pass
-        
-class BibTexParser(TexParser):
-    """Parse and format Error Messages from bibtex"""
-    def __init__(self, btex, verbose):
-        super(BibTexParser, self).__init__(btex,verbose)
-        self.patterns += [ 
-            (re.compile("Warning--I didn't find a database entry") , self.warning),
-            (re.compile(r'I found no \\\w+ command') , self.error),
-            (re.compile(r"I couldn't open style file"), self.error),
-            (re.compile(r"You're missing a field name---line (\d+)"), self.error),
-            (re.compile(r'Too many commas in name \d+ of'), self.error),
-            (re.compile(r'I was expecting a'),self.error),
-            (re.compile('This is BibTeX') , self.info),
-            (re.compile('The style') , self.info),
-            (re.compile('Database') , self.info),
-            (re.compile('---') , self.finishRun)
-        ]
-    
-    def finishRun(self,m,line):
-        self.done = True
-        print '</div>'
+            A summary explaining the reasoning why we show this notification
+            window.
 
-class BiberParser(TexParser):
-    """Parse and format Error Messages from biber"""
-    def __init__(self, btex, verbose):
-        super(BiberParser, self).__init__(btex,verbose)
-        self.patterns += [ 
-            (re.compile('^.*WARN') , self.warning),
-            (re.compile('^.*ERROR') , self.error),
-            (re.compile('^.*FATAL'), self.fatal),
-            (re.compile('^.*Output to (.*)$') , self.finishRun),
-        ]
-        
-    def warning(self,m,line):
-        """Using one print command works more reliably 
-           than using several lines"""
-        print '<p class="warning">' + line + '</p>'
-        self.numWarns += 1
+        messages
 
-    def finishRun(self,m,line):
-      logFile = m.group(1)[:-3] + 'blg'
-      print '<p>  Complete transcript is in '
-      print '<a href="' + make_link(os.path.join(os.getcwd(),logFile),'1') +  '">' + logFile + '</a>'
-      print '</p>'
-      self.done = True
-      print '</div>'
+            A list of strings containing informative messages.
 
-class LaTexParser(TexParser):
-    """Parse Output From Latex"""
-    def __init__(self, input_stream, verbose, fileName):
-        super(LaTexParser, self).__init__(input_stream,verbose)
-        self.suffix = fileName[fileName.rfind('.')+1:]
-        self.currentFile = fileName
-        self.patterns += [
-            #(re.compile('^This is') , self.info),
-            (re.compile('^Document Class') , self.info),
-            (re.compile('.*?\((\.\/[^\)]*?\.(tex|'+self.suffix+')( |$))') , self.detectNewFile),
-            (re.compile('.*\<use (.*?)\>') , self.detectInclude),
-            (re.compile('^Output written') , self.info),
-            (re.compile('LaTeX Warning:.*?input line (\d+)(\.|$)') , self.handleWarning),
-            (re.compile('LaTeX Warning:.*') , self.warning),
-            (re.compile('^([^:]*):(\d+):\s+(pdfTeX warning.*)') , self.handleFileLineWarning),            
-            (re.compile('.*pdfTeX warning.*') , self.warning),            
-            (re.compile('LaTeX Font Warning:.*') , self.warning),            
-            (re.compile('Overfull.*wide') , self.warn2),
-            (re.compile('Underfull.*badness') , self.warn2),                        
-            (re.compile('^([\.\/\w\x7f-\xff\- ]+(?:\.sty|\.tex|\.'+self.suffix+')):(\d+):\s+(.*)') , self.handleError),
-            (re.compile('([^:]*):(\d+): LaTeX Error:(.*)') , self.handleError),
-            (re.compile('([^:]*):(\d+): (Emergency stop)') , self.handleError),
-            (re.compile('Runaway argument') , self.pdfLatexError),            
-            (re.compile('Transcript written on (.*)\.$') , self.finishRun),
-            (re.compile('^Error: pdflatex') , self.pdfLatexError),
-            (re.compile('\!.*') , self.handleOldStyleErrors),
-            (re.compile('^\s+==>') , self.fatal)
-        ]
-        self.blankLine = re.compile(r'^\s*$')        
+        token
 
-    def detectNewFile(self,m,line):
-        self.currentFile = m.group(1).rstrip()
-        print "<h4>Processing: " + self.currentFile + "</h4>"
+            A token that can be used to reuse an already existing notification
+            window.
 
-    def detectInclude(self,m,line):
-        print "<ul><li>Including: " + m.group(1)
-        print "</li></ul>"
+    Returns: ``int``
 
-    def handleWarning(self,m,line):
-        print '<p class="warning"><a href="' + make_link(os.path.join(os.getcwd(),self.currentFile), m.group(1)) + '">'+line+"</a></p>"
-        self.numWarns += 1
-    
-    def handleFileLineWarning(self,m,line):
-        """Display warning. match m should contain file, line, warning message"""
-        print '<p class="warning"><a href="' + make_link(os.path.join(os.getcwd(), m.group(1)),m.group(2)) + '">' + m.group(3) + "</a></p>"
-        self.numWarns += 1
-    
-    def handleError(self,m,line):
-        print '<p class="error">'
-        print 'Latex Error: <a  href="' + make_link(os.path.join(os.getcwd(),m.group(1)),m.group(2)) +  '">' + m.group(1)+":"+m.group(2) + '</a> '+m.group(3)+'</p>'
-        self.numErrs += 1
-        
-    def finishRun(self,m,line):
-        logFile = m.group(1).strip('"')
-        print '<p>  Complete transcript is in '
-        print '<a href="' + make_link(os.path.join(os.getcwd(),logFile),'1') +  '">' + logFile + '</a>'
-        print '</p>'
-        self.done = True
-        
-    def handleOldStyleErrors(self,m,line):
-        if re.search('[Ee]rror', line):
-            print '<p class="error">'
-            print line
-            print '</p>'
-            self.numErrs += 1
-        else:
-            print '<p class="warning">'
-            print line
-            print '</p>'
-            self.numWarns += 1
-        
-    def pdfLatexError(self,m,line):
-        """docstring for pdfLatexError"""
-        self.numErrs += 1
-        print '<p class="error">'
-        print line
-        line = self.input_stream.readline()
-        if line and re.match('^ ==> Fatal error occurred', line):  
-            print line.rstrip("\n")
-            print '</p>'
-            self.isFatal = True
-        else:
-            if line:
-                print '<pre>    '+ line.rstrip("\n") + '</pre>'
-            print '</p>'
-        sys.stdout.flush()
-    
-    def badRun(self):
-        """docstring for finishRun"""
-        print '<p class="error">A fatal error occured, log file is in '
-        logFile = os.path.basename(os.getenv('TM_FILEPATH'))
-        logFile = logFile.replace(self.suffix,'log')
-        print '<a href="' + make_link(os.path.join(os.getcwd(),logFile),'1') +  '">' + logFile + '</a>'        
-        print '</p>'
+    Examples:
 
-class ParseLatexMk(TexParser):
-    """docstring for ParseLatexMk"""
-    def __init__(self, input_stream, verbose,filename):
-        super(ParseLatexMk, self).__init__(input_stream,verbose)
-        self.fileName = filename
-        self.patterns += [
-            (re.compile('This is (pdfTeX|latex2e|latex|XeTeX)') , self.startLatex),
-            (re.compile('This is BibTeX') , self.startBibtex),
-            (re.compile('^.*This is biber') , self.startBiber),
-            (re.compile('^Latexmk: All targets \(.*?\) are up-to-date') , self.finishRun),
-            (re.compile('This is makeindex') , self.startBibtex),
-            (re.compile('^Latexmk') , self.ltxmk),
-            (re.compile('Run number') , self.newRun)
-        ]
-        self.numRuns = 0
-    
-    def startBibtex(self,m,line):
-        print '<div class="bibtex">'
-        print '<h3>' + line[:-1] + '</h3>'
-        bp = BibTexParser(self.input_stream,self.verbose)
-        f,e,w = bp.parseStream()
-        self.numErrs += e
-        self.numWarns += w
+        >>> token = notify(summary='Mahatma Gandhi', messages=[
+        ...     "An eye for an eye only ends up making the whole world " +
+        ...     "blind."])
+        >>> # The token the function returns is a number
+        >>> token = int(token)
 
-    def startBiber(self,m,line):
-        print '<div class="biber">'
-        print '<h3>' + line + '</h3>'
-        bp = BiberParser(self.input_stream,self.verbose)
-        f,e,w = bp.parseStream()
-        self.numErrs += e
-        self.numWarns += w
+    """
+    dialog = getenv('DIALOG')
+    tm_support = getenv('TM_SUPPORT_PATH')
+    nib_location = '{}/nibs/SimpleNotificationWindow.nib'.format(tm_support)
+    log = '\n'.join(messages).replace('\\', '\\\\').replace('"', '\\"')
 
-    def startLatex(self,m,line):
-        print '<div class="latex">'
-        print '<hr>'
-        print '<h3>' + line[:-1] + '</h3>'
-        bp = LaTexParser(self.input_stream,self.verbose,self.fileName)
-        f,e,w = bp.parseStream()
-        self.numErrs += e
-        self.numWarns += w
+    command = "{} nib".format(shellquote(dialog))
+    content = shellquote(
+        """{{ title = "{}"; summary = "{}"; log = "{}"; }}""".format(
+            title, summary, log))
 
-    def newRun(self,m,line):
-        if self.numRuns > 0:
-            print '<hr />'
-            print '<p>', self.numErrs, 'Errors', self.numWarns, 'Warnings', 'in this run.', '</p>'
-        self.numWarns = 0
-        self.numErrs = 0
-        self.numRuns += 1
+    # Update notification window
+    if token:
+        command_update = "{} --update {} --model {}".format(
+            command, token, content)
+        notification_output = check_output(command_update,
+                                           stderr=STDOUT,
+                                           shell=True,
+                                           universal_newlines=True)
+        # If the window still exists and we could therefore update it here we
+        # return the token of the old window. If we could not update the
+        # window we get an error message. In this case we try to open a new
+        # notification window.
+        if notification_output.strip() == '':
+            return (int(token))
 
-    def finishRun(self,m,line):
-        self.ltxmk(m,line)
-        self.done = True
+    # Create new notification window
+    command_load = "{} --load {} --model {}".format(command,
+                                                    shellquote(nib_location),
+                                                    content)
+    notification_output = check_output(command_load,
+                                       shell=True,
+                                       universal_newlines=True)
+    return int(notification_output)
 
-    def ltxmk(self,m,line):
-        print '<p class="ltxmk">%s</p>'%line
 
-class ChkTeXParser(TexParser):
-    """Parse the output from chktex"""
-    def __init__(self, input_stream, verbose, filename):
-        super(ChkTeXParser, self).__init__(input_stream,verbose)
-        self.fileName = filename
-        self.patterns += [
-            (re.compile('^ChkTeX') , self.info),
-            (re.compile('Warning \d+ in (.*.tex) line (\d+):(.*)') , self.handleWarning),
-            (re.compile('Error \d+ in (.*.tex) line (\d+):(.*)') , self.handleError),
-        ]
-        self.numRuns = 0
-
-    def handleWarning(self,m,line):
-        """Display warning. match m should contain file, line, warning message"""
-        print '<p class="warning">Warning: <a href="' + make_link(os.path.join(os.getcwd(), m.group(1)),m.group(2)) + '">' + m.group(1)+ ": "+m.group(2)+":</a>"+m.group(3)+"</p>"
-        warnDetail = self.input_stream.readline()
-        if len(warnDetail) > 2:
-            print '<pre>',warnDetail[:-1]
-            print self.input_stream.readline()[:-1], '</pre>'
-        self.numWarns += 1
-
-    def handleError(self,m,line):
-        print '<p class="error">'
-        print 'Error: <a  href="' + make_link(os.path.join(os.getcwd(),m.group(1)),m.group(2)) +  '">' + m.group(1)+":"+m.group(2) + ':</a> '+m.group(3)+'</p>'
-        print '<pre>', self.input_stream.readline()[:-1]
-        print self.input_stream.readline()[:-1], '</pre>'
-        self.numErrs += 1
+# -- Main ---------------------------------------------------------------------
 
 if __name__ == '__main__':
-    # test
-    stream = open('../tex/test.log')
-    lp = LaTexParser(stream,False,"test.tex")
-    lp = BiberParser(stream, False)
-    f,e,w = lp.parseStream()
-    
 
+    parser = ArgumentParser(description='Parse output from latexmk.')
+    parser.add_argument(
+        '-notify',
+        default='',
+        nargs='?',
+        help="""Open a notification window to show warning and error messages.
+                To reuse a notification window already opened, just provide
+                its notification token.
+
+                To open a new window containing old messages stored in the
+                cache provide the argument `reload`. If the cache file does
+                not exist yet or the old messages could not be read for some
+                other reasons, then `reload` will just fail silently.""")
+
+    parser.add_argument(
+        'logfile',
+        help="""The location of the log file that should be parsed.""")
+    parser.add_argument(
+        'file',
+        help="""The location of the (master) tex file without its extension.
+                This has to be the file from which the output in `logfile` was
+                generated.""")
+    arguments = parser.parse_args()
+
+    logfile = arguments.logfile
+    notification_token = arguments.notify
+    texfile = '{}.tex'.format(arguments.file)
+    cachefile = join(dirname(arguments.file),
+                     '.{}.lb'.format(basename(arguments.file)))
+
+    if notification_token == 'reload':
+        try:
+            # Try to read from cache
+            with open(cachefile, 'rb') as storage:
+                typesetting_data = load(storage)
+                messages = typesetting_data['messages']
+            notification_token = None
+        except IOError:
+            # Fail silently
+            exit(0)
+    else:
+        # Depending on the error the tex engine might return a log file in a
+        # different encoding.
+        for encoding in encodings:
+            try:
+                texparser = LaTexMkParser(open(logfile, encoding=encoding),
+                                          verbose=False,
+                                          filename=texfile)
+                texparser.parse_stream()
+                break
+            except UnicodeDecodeError:
+                continue
+        # Sort marks by line number
+        marks = sorted(texparser.marks, key=lambda marks: marks[1])
+        update_marks(cachefile, marks)
+        messages = [
+            "{:<7} {}:{} — {}".format(severity.upper(), basename(filename),
+                                      line, message)
+            for (filename, line, severity, message) in marks
+        ]
+        if not messages:
+            messages = [
+                "Could not find any messages containing line information.",
+                "Please take a look at the log file {}.latexmk.log ".format(
+                    basename(arguments.file)) +
+                "to find the source of the problem."
+            ]
+
+        try:
+            # Try to update data in cache file
+            with open(cachefile, 'r+b') as storage:
+                typesetting_data = load(storage)
+                typesetting_data['messages'] = messages
+                storage.seek(0)
+                dump(typesetting_data, storage)
+        except IOError:
+            print('Could not access cache file {}!'.format(cachefile))
+
+    if notification_token != '':
+        new_token = notify(summary='Errors While Typesetting {}'.format(
+            basename(texfile)),
+                           messages=messages,
+                           token=notification_token)
+        print("Notification Token: |{}|".format(new_token))

@@ -6,9 +6,15 @@
 	<string>saveActiveFile</string>
 	<key>command</key>
 	<string>#!/usr/bin/env bash
-[[ -f "${TM_SUPPORT_PATH}/lib/bash_init.sh" ]] &amp;&amp; . "${TM_SUPPORT_PATH}/lib/bash_init.sh"
+[[ -f "${TM_SUPPORT_PATH}/lib/bash_init.sh" ]] &amp;&amp; \
+. "${TM_SUPPORT_PATH}/lib/bash_init.sh"
 
-"$TM_BUNDLE_SUPPORT"/bin/texcount.pl "$TM_FILEPATH"</string>
+DIRECTORY=$(dirname "${TM_FILEPATH}")
+FILENAME=$(basename "${TM_FILEPATH}")
+OPTIONS=($TM_TEXCOUNT_OPTIONS)
+cd "$DIRECTORY"
+
+texcount -nocol -utf8 -inc "${OPTIONS[@]}" "$FILENAME"</string>
 	<key>input</key>
 	<string>none</string>
 	<key>inputFormat</key>
@@ -23,6 +29,19 @@
 	<string>text</string>
 	<key>outputLocation</key>
 	<string>toolTip</string>
+	<key>requiredCommands</key>
+	<array>
+		<dict>
+			<key>command</key>
+			<string>texcount</string>
+			<key>locations</key>
+			<array>
+				<string>/Library/TeX/texbin/texcount</string>
+				<string>/usr/texbin/texcount</string>
+				<string>/opt/local/bin/texcount</string>
+			</array>
+		</dict>
+	</array>
 	<key>scope</key>
 	<string>text.tex.latex</string>
 	<key>uuid</key>
